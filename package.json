@@ -1,0 +1,9 @@
+{
+  "name": "aooni-tag",
+  "version": "1.0.0",
+  "description": "아오오니 술래잡기 멀티플레이 서버",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "ws": "^8.18.0" }
+}
