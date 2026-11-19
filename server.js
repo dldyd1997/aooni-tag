@@ -3,6 +3,11 @@
 const http = require('http'), fs = require('fs'), zlib = require('zlib'), path = require('path'), os = require('os');
 const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 3000, MAX_PLAYERS = 40, TICK_MS = 50, STALE_MS = 6000;
+const HOST_KEY = process.env.HOST_KEY || '';                    // 방장 비밀번호 (Render 환경변수로 설정)
+const HOST_GRACE = +process.env.HOST_GRACE_MS || 60000;         // 방장이 없을 때 방을 닫기까지의 유예 시간
+const crypto = require('crypto');
+const sha = x => crypto.createHash('sha256').update(String(x)).digest();
+const keyOk = k => !!HOST_KEY && crypto.timingSafeEqual(sha(k), sha(HOST_KEY));
 const COUNT = +process.env.COUNT_MS || 10000;   // 입장 후 아오오니가 정해지기까지
 const ROUND = +process.env.ROUND_MS || 90000;   // 아오오니가 정해진 뒤 라운드 시간
 const END = +process.env.END_MS || 6000;        // 결과 화면 시간
@@ -34,8 +39,12 @@ const rooms = new Map();
 let seq = 0;
 const num = (v, lo, hi) => Math.min(hi, Math.max(lo, +v || 0));
 const int = v => (+v | 0);
-const mkRoom = () => ({ clients: new Map(), dirty: true, lastB: 0, ph: 'lobby', rd: 0, t0: 0, oni: 0, pz: 0, endAt: 0, why: '', pl: [], n0: 0, map: -1, cur: 0 });
-const hostOf = room => { let h = 0; for (const c of room.clients.values()) if (c.joined && (!h || c.id < h)) h = c.id; return h; };
+const mkRoom = () => ({ clients: new Map(), dirty: true, lastB: 0, ph: 'lobby', rd: 0, t0: 0, oni: 0, pz: 0, endAt: 0, why: '', pl: [], n0: 0, map: -1, cur: 0, ban: new Map(), hadHost: false, noHost: 0 });
+const hostOf = room => { let h = 0; for (const c of room.clients.values()) if (c.joined && (!HOST_KEY || c.isHost) && (!h || c.id < h)) h = c.id; return h; };
+function closeRoom(name, room, reason) {        // 방을 닫고 모두 내보내기
+  if (rooms.get(name) === room) rooms.delete(name);
+  for (const c of room.clients.values()) { try { c.ws.send(JSON.stringify({ t: 'x', r: reason })); } catch {} setTimeout(() => { try { c.ws.close(); } catch {} }, 100); }
+}
 const endRound = (room, why) => { room.ph = 'end'; room.why = why; room.endAt = Date.now(); room.pz = 0; room.dirty = true; };
 
 wss.on('connection', (ws, req) => {
@@ -45,8 +54,10 @@ wss.on('connection', (ws, req) => {
   if (!room) { room = mkRoom(); rooms.set(name, room); }
   if (room.clients.size >= MAX_PLAYERS) { ws.close(1013, 'full'); return; }
 
+  const cid = (q.get('cid') || '').slice(0, 40);
+  if (cid && (room.ban.get(cid) || 0) > Date.now()) { ws.send(JSON.stringify({ t: 'k' })); ws.close(); return; }
   const id = ++seq;
-  const c = { ws, id, d: null, last: 0, seen: Date.now(), alive: true, joined: false, n: '', ch: 0 };
+  const c = { ws, id, d: null, last: 0, seen: Date.now(), alive: true, joined: false, n: '', ch: 0, cid };
   room.clients.set(id, c);
   room.dirty = true;
   ws.send(JSON.stringify({ t: 'h', id, seq: id }));
@@ -61,10 +72,15 @@ wss.on('connection', (ws, req) => {
       c.last = now;
       const d = m.d; if (!d || typeof d !== 'object' || !c.joined) return;
       c.d = { n: c.n, x: num(d.x, 0, 700), y: num(d.y, 0, 900), c: d.c ? 1 : 0, rk: String(d.rk || '').slice(0, 12),
-              dr: int(d.dr) & 3, mv: d.mv ? 1 : 0, ch: c.ch, mp: int(d.mp) & 7 };
+              dr: int(d.dr) & 3, mv: d.mv ? 1 : 0, ch: c.ch, mp: int(d.mp) & 7, on: d.on ? 1 : 0 };
       c.seen = now; room.dirty = true;
     } else if (m.t === 'j') {                       // 입장(닉네임/캐릭터 등록)
       c.joined = true; c.n = String(m.n || '플레이어').slice(0, 8); c.ch = int(m.ch) & 1; room.dirty = true;
+      if (HOST_KEY && m.k) {                        // 방장 비밀번호 확인
+        if (keyOk(m.k)) { c.isHost = true; room.hadHost = true; }
+        else { c.isHost = false; c.fails = (c.fails || 0) + 1; if (c.fails >= 5) ws.close(); }
+        try { ws.send(JSON.stringify({ t: 'a', ok: !!c.isHost })); } catch {}
+      }
     } else if (m.t === 'start') {                   // 방장이 게임 시작
       if (c.id !== hostOf(room) || room.ph !== 'lobby') return;
       room.pl = [...room.clients.values()].filter(x => x.joined).map(x => x.id);
@@ -74,32 +90,48 @@ wss.on('connection', (ws, req) => {
     } else if (m.t === 'map') {                     // 방장이 맵 선택 (-1 = 랜덤)
       if (c.id !== hostOf(room) || room.ph !== 'lobby') return;
       room.map = Math.max(-1, Math.min(NMAPS - 1, int(m.i))); room.dirty = true;
+    } else if (m.t === 'close') {                   // 방장이 방 닫기 (모두 내보내기)
+      if (c.id === hostOf(room)) closeRoom(name, room, 'host');
+    } else if (m.t === 'kick') {                    // 방장이 강퇴 (10분간 재입장 차단)
+      if (c.id !== hostOf(room)) return;
+      const tid = int(m.id), tc = room.clients.get(tid);
+      if (!tc || tid === c.id) return;
+      if (tc.cid) room.ban.set(tc.cid, Date.now() + 10 * 60 * 1000);
+      try { tc.ws.send(JSON.stringify({ t: 'k' })); } catch {}
+      setTimeout(() => { try { tc.ws.close(); } catch {} }, 60);
     } else if (m.t === 'pause') {                   // 방장이 일시정지/재개
       if (c.id !== hostOf(room) || (room.ph !== 'count' && room.ph !== 'play')) return;
       if (room.pz) { room.t0 += now - room.pz; room.pz = 0; } else room.pz = now;
       room.dirty = true;
     } else if (m.t === 'end') {                     // 아오오니가 모두 잡았다고 보고
-      if (room.ph === 'play' && c.id === room.oni && !room.pz) endRound(room, 'oni');
+      if (room.ph === 'play' && !room.pz && room.pl.includes(c.id)) endRound(room, 'oni');   // 모두 아오오니가 되면 종료
     }
   });
   ws.on('close', () => {
     room.clients.delete(id); room.dirty = true;
-    if (!room.clients.size) rooms.delete(name);
+    if (!room.clients.size && rooms.get(name) === room) rooms.delete(name);
   });
 });
 
 setInterval(() => {
   const now = Date.now();
   for (const [name, room] of rooms) {
+    if (HOST_KEY) {                                  // 방장이 일정 시간 없으면 방을 닫아 남은 사람을 정리
+      if (hostOf(room)) room.noHost = 0;
+      else if (!room.noHost) room.noHost = now;
+      else if (now - room.noHost > HOST_GRACE) { closeRoom(name, room, room.hadHost ? 'host' : 'nohost'); continue; }
+    }
     if (!room.pz) {
       const alive = room.pl.filter(id => room.clients.has(id));
       if (room.ph === 'count') {
         if (alive.length < 1) { room.ph = 'lobby'; room.dirty = true; }
         else if (now - room.t0 >= COUNT) { room.oni = alive[Math.random() * alive.length | 0]; room.ph = 'play'; room.t0 = now; room.dirty = true; }
       } else if (room.ph === 'play') {
-        if (!room.clients.has(room.oni)) endRound(room, 'gone');
-        else if (room.n0 > 1 && alive.length <= 1) endRound(room, 'run');
-        else if (now - room.t0 >= ROUND) endRound(room, 'run');
+        if (!room.clients.has(room.oni)) {          // 처음 아오오니가 나갔을 때: 감염자가 있으면 계속, 없으면 새로 지정
+          const infected = alive.some(id => { const x = room.clients.get(id); return x && x.d && x.d.on; });
+          if (!infected) { if (alive.length >= 2) { room.oni = alive[Math.random() * alive.length | 0]; room.dirty = true; } else endRound(room, 'gone'); }
+        }
+        if (room.ph === 'play') { if (room.n0 > 1 && alive.length <= 1) endRound(room, 'run'); else if (now - room.t0 >= ROUND) endRound(room, 'run'); }
       } else if (room.ph === 'end' && now - room.endAt >= END) { room.ph = 'lobby'; room.dirty = true; }
     }
     if (now - room.lastB > 1000) room.dirty = true;     // 1초마다 서버 시간 동기화
@@ -121,4 +153,4 @@ setInterval(() => {
   }
 }, 10000);
 
-server.listen(PORT, () => console.log('서버 실행 중: http://localhost:' + PORT));
+server.listen(PORT, () => console.log('서버 실행 중: http://localhost:' + PORT + (HOST_KEY ? ' (방장 비밀번호 사용)' : ' (주의: HOST_KEY 미설정 - 가장 먼저 입장한 사람이 방장)')));
