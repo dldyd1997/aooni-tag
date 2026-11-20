@@ -10,7 +10,7 @@ const sha = x => crypto.createHash('sha256').update(String(x)).digest();
 const keyOk = k => !!HOST_KEY && crypto.timingSafeEqual(sha(k), sha(HOST_KEY));
 const COUNT = +process.env.COUNT_MS || 10000;   // 입장 후 아오오니가 정해지기까지
 const ROUND = +process.env.ROUND_MS || 90000;   // 아오오니가 정해진 뒤 라운드 시간
-const END = +process.env.END_MS || 6000;        // 결과 화면 시간
+const END = +process.env.END_MS || 8000;        // 결과 화면 시간
 
 const html = fs.readFileSync(path.join(__dirname, 'index.html'));
 const NMAPS = +((/const NMAPS=(\d+)/.exec(html.toString('utf8')) || [0, 1])[1]);   // 맵 개수 (index.html과 자동 동기화)
@@ -131,7 +131,19 @@ setInterval(() => {
           const infected = alive.some(id => { const x = room.clients.get(id); return x && x.d && x.d.on; });
           if (!infected) { if (alive.length >= 2) { room.oni = alive[Math.random() * alive.length | 0]; room.dirty = true; } else endRound(room, 'gone'); }
         }
-        if (room.ph === 'play') { if (room.n0 > 1 && alive.length <= 1) endRound(room, 'run'); else if (now - room.t0 >= ROUND) endRound(room, 'run'); }
+        if (room.ph === 'play') {
+          if (room.n0 > 1 && alive.length <= 1) endRound(room, 'run');
+          else if (now - room.t0 >= ROUND) endRound(room, 'run');
+          else if (room.n0 > 1 && now - room.t0 > 2000) {   // 도망자가 한 명도 안 남으면 서버가 직접 종료 (나간 사람/멈춘 화면은 제외)
+            let runners = 0;
+            for (const id of alive) {
+              const x = room.clients.get(id);
+              if (!x || id === room.oni || !x.d || now - x.seen >= STALE_MS) continue;
+              if (!x.d.on) runners++;
+            }
+            if (runners === 0) endRound(room, 'oni');
+          }
+        }
       } else if (room.ph === 'end' && now - room.endAt >= END) { room.ph = 'lobby'; room.dirty = true; }
     }
     if (now - room.lastB > 1000) room.dirty = true;     // 1초마다 서버 시간 동기화
